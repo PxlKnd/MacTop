@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "→ Kompiliere MacTopWidget ..."
-swiftc -O Sources/Metrics.swift Sources/main.swift -o MacTopWidget \
+swiftc -O Sources/Metrics.swift Sources/HueClient.swift Sources/main.swift -o MacTopWidget \
     -framework Cocoa -framework IOKit -lIOReport
 
 echo "→ Binär: $(pwd)/MacTopWidget ($(du -h MacTopWidget | cut -f1))"

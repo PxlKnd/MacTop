@@ -105,16 +105,36 @@ final class WidgetCanvasView: NSView {
 
     // Base design dimensions (at scale = 1.0)
     static let baseWidth: CGFloat = 780
-    static let baseHeight: CGFloat = 562
+    static let coreHeight: CGFloat = 562
+    static let hueHeaderHeight: CGFloat = 40
+    static let hueRowHeight: CGFloat = 44
+    static let hueRowGap: CGFloat = 8
+    static let hueColsPerRow: Int = 5
+
+    var showHueSection: Bool = false
+    var hueRowCount: Int = 1
+
+    static func hueSectionHeight(forRows rows: Int) -> CGFloat {
+        let r = max(1, rows)
+        return hueHeaderHeight + CGFloat(r) * hueRowHeight + CGFloat(max(0, r - 1)) * hueRowGap + 12
+    }
+
+    var currentBaseHeight: CGFloat {
+        showHueSection ? (Self.coreHeight + Self.hueSectionHeight(forRows: hueRowCount)) : Self.coreHeight
+    }
 
     var uiScale: CGFloat = 1.0
+
+    // Hit-test rectangles in scaled view coordinates (rebuilt on draw)
+    private var hueChipRects: [(groupId: String, rect: NSRect)] = []
+    private var hueAllOffRect: NSRect? = nil
 
     init(model: SystemModel, scale: CGFloat) {
         self.model = model
         self.uiScale = scale
         super.init(frame: NSRect(x: 0, y: 0,
                                  width: Self.baseWidth * scale,
-                                 height: Self.baseHeight * scale))
+                                 height: Self.coreHeight * scale))
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -228,8 +248,10 @@ final class WidgetCanvasView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         let W = Self.baseWidth
-        let H = Self.baseHeight
+        let coreH = Self.coreHeight
         let pad: CGFloat = 22
+        hueChipRects.removeAll(keepingCapacity: true)
+        hueAllOffRect = nil
 
         // Dezent abgedunkelter Rahmen über dem echten macOS Blur-Material für optimalen Kontrast
         let cardRadius = S(22)
@@ -267,10 +289,10 @@ final class WidgetCanvasView: NSView {
         let rightX: CGFloat = divX + colGap / 2
         let rightRight: CGFloat = W - pad
 
-        // Vertikale Trennlinie
+        // Vertikale Trennlinie (nur über den System-Monitor-Bereich)
         let vLine = NSBezierPath()
         vLine.move(to: NSPoint(x: S(divX), y: S(54)))
-        vLine.line(to: NSPoint(x: S(divX), y: S(H - 18)))
+        vLine.line(to: NSPoint(x: S(divX), y: S(coreH - 14)))
         vLine.lineWidth = max(1, S(1.2))
         cLine.setStroke()
         vLine.stroke()
@@ -467,16 +489,134 @@ final class WidgetCanvasView: NSView {
             drawTextRight(memStr, rightX: rightRight, y: ry, size: 13, color: cDim, weight: .medium)
             ry += 21.5
         }
+
+        // ════════════════════════════════════════════════════════════════
+        // OPTIONALE PHILIPS HUE LEISTE (unten über volle Breite)
+        // ════════════════════════════════════════════════════════════════
+        if showHueSection, let hue = controller?.hue {
+            let hy = coreH - 4
+            hLine(x1: pad, x2: W - pad, y: hy)
+
+            let titleY = hy + 10
+            let cHueOn = NSColor(srgbRed: 1.00, green: 0.78, blue: 0.28, alpha: 1.0)
+            drawText("✦ PHILIPS HUE", x: pad, y: titleY, size: 12.5, color: cHueOn, weight: .bold)
+
+            if hue.isPairing {
+                drawText(hue.statusMessage, x: pad + 132, y: titleY, size: 12.5, color: cText, weight: .semibold)
+            } else {
+                drawText("Klick: An/Aus  ·  Scroll: Dimmen  ·  Rechtsklick: Szenen",
+                         x: pad + 128, y: titleY + 0.5, size: 11.5, color: cDim, weight: .regular)
+
+                // "Alle aus"-Button rechts im Header der Hue-Leiste
+                let anyOn = hue.groups.contains { $0.isOn }
+                let btnW: CGFloat = 78
+                let btnH: CGFloat = 20
+                let btnRect = NSRect(x: S(W - pad - btnW), y: S(titleY - 2), width: S(btnW), height: S(btnH))
+                hueAllOffRect = btnRect
+                let btnPath = NSBezierPath(roundedRect: btnRect, xRadius: S(6), yRadius: S(6))
+                (anyOn
+                    ? NSColor(srgbRed: 0.95, green: 0.36, blue: 0.36, alpha: 0.22)
+                    : NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.06)).setFill()
+                btnPath.fill()
+                (anyOn
+                    ? NSColor(srgbRed: 0.95, green: 0.36, blue: 0.36, alpha: 0.55)
+                    : NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.14)).setStroke()
+                btnPath.lineWidth = max(1, S(1))
+                btnPath.stroke()
+                drawTextRight("Alle aus", rightX: W - pad - 9, y: titleY + 0.5, size: 11,
+                              color: anyOn ? NSColor(srgbRed: 1.0, green: 0.62, blue: 0.62, alpha: 1) : cDim,
+                              weight: .semibold)
+            }
+
+            // Alle Raum-/Zonen-Chips in einem automatischen Multi-Zeilen-Grid (5 pro Zeile — zeigt alle Räume, nichts wird abgeschnitten)
+            let visibleGroups = hue.groups
+            let chipStartY = hy + 36
+            let chipH: CGFloat = Self.hueRowHeight
+            let rowGap: CGFloat = Self.hueRowGap
+            if visibleGroups.isEmpty {
+                let msg = hue.isPairing
+                    ? "Bitte jetzt den runden Link-Knopf oben auf deiner Hue Bridge drücken…"
+                    : "Verbunden — lade Räume…"
+                drawText(msg, x: pad, y: chipStartY + 12, size: 13, color: cDim, weight: .medium)
+            } else {
+                let totalCount = visibleGroups.count
+                let cols = min(Self.hueColsPerRow, max(1, totalCount))
+                let gap: CGFloat = 8
+                let totalW = W - 2 * pad
+                let chipW = (totalW - CGFloat(max(0, cols - 1)) * gap) / CGFloat(cols)
+
+                for (idx, g) in visibleGroups.enumerated() {
+                    let row = idx / cols
+                    let col = idx % cols
+                    let cx = pad + CGFloat(col) * (chipW + gap)
+                    let cy = chipStartY + CGFloat(row) * (chipH + rowGap)
+                    let rect = NSRect(x: S(cx), y: S(cy), width: S(chipW), height: S(chipH))
+                    hueChipRects.append((groupId: g.id, rect: rect))
+
+                    let r = S(9)
+                    let path = NSBezierPath(roundedRect: rect, xRadius: r, yRadius: r)
+                    if g.isOn {
+                        NSColor(srgbRed: 1.00, green: 0.76, blue: 0.24, alpha: 0.18).setFill()
+                        path.fill()
+                        NSColor(srgbRed: 1.00, green: 0.78, blue: 0.30, alpha: 0.55).setStroke()
+                    } else {
+                        NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.06).setFill()
+                        path.fill()
+                        NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.14).setStroke()
+                    }
+                    path.lineWidth = max(1, S(1))
+                    path.stroke()
+
+                    // Status-Punkt + Raumname (+ Lampenanzahl-Hinweis bei mehreren Leuchten)
+                    let dotR: CGFloat = 4.0
+                    let dotRect = NSRect(x: S(cx + 8), y: S(cy + 9.5), width: S(dotR * 2), height: S(dotR * 2))
+                    (g.isOn ? cHueOn : NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.22)).setFill()
+                    NSBezierPath(ovalIn: dotRect).fill()
+
+                    let multiBadge = g.lights.count > 1 ? " (\(g.lights.count))" : ""
+                    drawText(g.name + multiBadge, x: cx + 20, y: cy + 6, size: 12,
+                             color: g.isOn ? cText : cDim, weight: .bold, maxWidth: chipW - 26)
+
+                    // Mini-Helligkeitsbalken + Prozentwert unten im Chip
+                    let pctText = g.isOn ? String(format: "%.0f%%", g.brightness) : "AUS"
+                    drawTextRight(pctText, rightX: cx + chipW - 7, y: cy + 24, size: 10.5,
+                                  color: g.isOn ? cHueOn : cDim, weight: .semibold)
+                    let barW = max(16, chipW - 48)
+                    hBar(x: cx + 8, y: cy + 29, w: barW, h: 4.5,
+                         pct: g.isOn ? g.brightness : 0,
+                         color: g.isOn ? cHueOn : cDim)
+                }
+            }
+        }
     }
 
-    // MARK: - Dragging & Context Menu
+    // MARK: - Dragging, Hue Interactions & Context Menu
 
     private var dragStartMouse: NSPoint?
     private var dragStartOrigin: NSPoint?
+    private var activeHuePress: String?
+    private var pressedAllOff: Bool = false
+    private var lastScrollTime: CFAbsoluteTime = 0
+
+    private func hitHueGroup(at pt: NSPoint) -> String? {
+        for item in hueChipRects {
+            if item.rect.contains(pt) { return item.groupId }
+        }
+        return nil
+    }
 
     override func mouseDown(with event: NSEvent) {
         if event.modifierFlags.contains(.control) {
             rightMouseDown(with: event)
+            return
+        }
+        let pt = convert(event.locationInWindow, from: nil)
+        if let allRect = hueAllOffRect, allRect.contains(pt) {
+            pressedAllOff = true
+            return
+        }
+        if let gid = hitHueGroup(at: pt) {
+            activeHuePress = gid
             return
         }
         if !(controller?.positionLocked ?? false), let win = window {
@@ -486,6 +626,7 @@ final class WidgetCanvasView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        guard activeHuePress == nil, !pressedAllOff else { return }
         guard !(controller?.positionLocked ?? false),
               let win = window,
               let sm = dragStartMouse,
@@ -495,6 +636,21 @@ final class WidgetCanvasView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        if pressedAllOff {
+            pressedAllOff = false
+            if let allRect = hueAllOffRect, allRect.contains(pt) {
+                controller?.hue.allLightsOff()
+            }
+            return
+        }
+        if let gid = activeHuePress {
+            activeHuePress = nil
+            if hitHueGroup(at: pt) == gid {
+                controller?.hue.toggleGroup(gid)
+            }
+            return
+        }
         if dragStartOrigin != nil, let win = window {
             controller?.saveCurrentPosition(win.frame.origin)
         }
@@ -502,8 +658,111 @@ final class WidgetCanvasView: NSView {
         dragStartOrigin = nil
     }
 
+    override func scrollWheel(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        guard let gid = hitHueGroup(at: pt) else {
+            super.scrollWheel(with: event)
+            return
+        }
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastScrollTime > 0.08 else { return }
+        let dy = event.scrollingDeltaY
+        guard abs(dy) > 0.2 else { return }
+        lastScrollTime = now
+        let step: Double = dy > 0 ? 8.0 : -8.0
+        controller?.hue.adjustGroupBrightness(gid, delta: step)
+    }
+
     override func rightMouseDown(with event: NSEvent) {
         guard let ctrl = controller else { return }
+        let pt = convert(event.locationInWindow, from: nil)
+
+        // Rechtsklick direkt auf einen Hue-Raum-Chip → Szenen & Helligkeits-Schnellmenü für diesen Raum!
+        if let gid = hitHueGroup(at: pt),
+           let group = ctrl.hue.groups.first(where: { $0.id == gid }) {
+            let gMenu = NSMenu(title: group.name)
+
+            let hdr = NSMenuItem(title: "✦ \(group.name) (\(group.isOn ? "\(Int(group.brightness)) %" : "Aus"))", action: nil, keyEquivalent: "")
+            hdr.isEnabled = false
+            gMenu.addItem(hdr)
+
+            let toggleItem = NSMenuItem(title: group.isOn ? "Alle im Raum ausschalten" : "Alle im Raum einschalten",
+                                        action: #selector(AppDelegate.hueToggleGroupMenu(_:)), keyEquivalent: "")
+            toggleItem.target = ctrl
+            toggleItem.representedObject = group.id
+            gMenu.addItem(toggleItem)
+
+            // Einzelleuchten dieses Raums direkt steuerbar (bei Räumen mit mehreren Leuchten)
+            if group.lights.count > 1 {
+                gMenu.addItem(.separator())
+                let lHdr = NSMenuItem(title: "Einzelleuchten", action: nil, keyEquivalent: "")
+                lHdr.isEnabled = false
+                gMenu.addItem(lHdr)
+
+                for light in group.lights {
+                    let lSub = NSMenu(title: light.name)
+                    let lt = NSMenuItem(title: light.isOn ? "Ausschalten" : "Einschalten",
+                                        action: #selector(AppDelegate.hueToggleLightMenu(_:)), keyEquivalent: "")
+                    lt.target = ctrl
+                    lt.representedObject = light.id
+                    lSub.addItem(lt)
+
+                    if light.supportsDimming {
+                        lSub.addItem(.separator())
+                        for pct in [10, 25, 50, 75, 100] {
+                            let lb = NSMenuItem(title: "\(pct) %",
+                                                action: #selector(AppDelegate.hueSetLightBrightnessMenu(_:)), keyEquivalent: "")
+                            lb.target = ctrl
+                            lb.representedObject = ["lightId": light.id, "brightness": Double(pct)] as [String: Any]
+                            lb.state = (light.isOn && abs(light.brightness - Double(pct)) < 6) ? .on : .off
+                            lSub.addItem(lb)
+                        }
+                    }
+
+                    let title = "\(light.isOn ? "●" : "○") \(light.name)\(light.isOn ? " (\(Int(light.brightness)) %)" : " (Aus)")"
+                    let lItem = NSMenuItem(title: title, action: #selector(AppDelegate.hueToggleLightMenu(_:)), keyEquivalent: "")
+                    lItem.target = ctrl
+                    lItem.representedObject = light.id
+                    lItem.submenu = lSub
+                    gMenu.addItem(lItem)
+                }
+            }
+
+            gMenu.addItem(.separator())
+
+            let briHdr = NSMenuItem(title: "Helligkeit", action: nil, keyEquivalent: "")
+            briHdr.isEnabled = false
+            gMenu.addItem(briHdr)
+            for pct in [10, 25, 50, 75, 100] {
+                let bItem = NSMenuItem(title: "\(pct) %", action: #selector(AppDelegate.hueSetBrightnessMenu(_:)), keyEquivalent: "")
+                bItem.target = ctrl
+                bItem.representedObject = ["groupId": group.id, "brightness": Double(pct)] as [String: Any]
+                bItem.state = (group.isOn && abs(group.brightness - Double(pct)) < 6) ? .on : .off
+                gMenu.addItem(bItem)
+            }
+
+            if !group.scenes.isEmpty {
+                gMenu.addItem(.separator())
+                let sHdr = NSMenuItem(title: "Szenen", action: nil, keyEquivalent: "")
+                sHdr.isEnabled = false
+                gMenu.addItem(sHdr)
+                for sc in group.scenes.prefix(16) {
+                    let sItem = NSMenuItem(title: sc.name, action: #selector(AppDelegate.hueActivateSceneMenu(_:)), keyEquivalent: "")
+                    sItem.target = ctrl
+                    sItem.representedObject = ["sceneId": sc.id, "groupId": group.id] as [String: Any]
+                    gMenu.addItem(sItem)
+                }
+            }
+
+            gMenu.addItem(.separator())
+            let hideHue = NSMenuItem(title: "Philips Hue Leiste ausblenden", action: #selector(AppDelegate.toggleHueVisible), keyEquivalent: "")
+            hideHue.target = ctrl
+            gMenu.addItem(hideHue)
+
+            NSMenu.popUpContextMenu(gMenu, with: event, for: self)
+            return
+        }
+
         let menu = NSMenu(title: "MacTop")
 
         // Automatische Monitor-Anpassung (55" vs. 14" MacBook)
@@ -540,6 +799,111 @@ final class WidgetCanvasView: NSView {
             item.state = abs(uiScale - sc) < 0.03 ? .on : .off
             menu.addItem(item)
         }
+
+        menu.addItem(.separator())
+
+        // Philips Hue Untermenü
+        let hueMenu = NSMenu(title: "Philips Hue")
+        let hueVisItem = NSMenuItem(title: "Hue-Leiste im Widget anzeigen", action: #selector(AppDelegate.toggleHueVisible), keyEquivalent: "")
+        hueVisItem.target = ctrl
+        hueVisItem.state = ctrl.hueBarEnabled ? .on : .off
+        hueMenu.addItem(hueVisItem)
+
+        let hueLaptopItem = NSMenuItem(title: "Unterwegs (14\" Solo) automatisch ausblenden", action: #selector(AppDelegate.toggleHueHideOnLaptop), keyEquivalent: "")
+        hueLaptopItem.target = ctrl
+        hueLaptopItem.state = ctrl.hueHideOnLaptop ? .on : .off
+        hueMenu.addItem(hueLaptopItem)
+
+        hueMenu.addItem(.separator())
+
+        if ctrl.hue.isConfigured {
+            let statusStr = ctrl.hue.isReachable
+                ? "Status: Verbunden (\(ctrl.hue.bridgeHost ?? ""))"
+                : "Status: Bridge nicht erreichbar (\(ctrl.hue.bridgeHost ?? ""))"
+            let stItem = NSMenuItem(title: statusStr, action: nil, keyEquivalent: "")
+            stItem.isEnabled = false
+            hueMenu.addItem(stItem)
+
+            if ctrl.hue.isReachable && !ctrl.hue.groups.isEmpty {
+                hueMenu.addItem(.separator())
+                for g in ctrl.hue.groups {
+                    let gSub = NSMenu(title: g.name)
+                    let tIt = NSMenuItem(title: g.isOn ? "Alle im Raum ausschalten" : "Alle im Raum einschalten",
+                                         action: #selector(AppDelegate.hueToggleGroupMenu(_:)), keyEquivalent: "")
+                    tIt.target = ctrl; tIt.representedObject = g.id
+                    gSub.addItem(tIt)
+                    if g.lights.count > 1 {
+                        gSub.addItem(.separator())
+                        for l in g.lights {
+                            let lSub = NSMenu(title: l.name)
+                            let lt = NSMenuItem(title: l.isOn ? "Ausschalten" : "Einschalten",
+                                                action: #selector(AppDelegate.hueToggleLightMenu(_:)), keyEquivalent: "")
+                            lt.target = ctrl; lt.representedObject = l.id
+                            lSub.addItem(lt)
+                            if l.supportsDimming {
+                                for pct in [25, 50, 75, 100] {
+                                    let lb = NSMenuItem(title: "Helligkeit \(pct) %",
+                                                        action: #selector(AppDelegate.hueSetLightBrightnessMenu(_:)), keyEquivalent: "")
+                                    lb.target = ctrl
+                                    lb.representedObject = ["lightId": l.id, "brightness": Double(pct)] as [String: Any]
+                                    lSub.addItem(lb)
+                                }
+                            }
+                            let lRow = NSMenuItem(title: "\(l.isOn ? "●" : "○") \(l.name)\(l.isOn ? " (\(Int(l.brightness)) %)" : "")",
+                                                  action: #selector(AppDelegate.hueToggleLightMenu(_:)), keyEquivalent: "")
+                            lRow.target = ctrl; lRow.representedObject = l.id
+                            lRow.submenu = lSub
+                            gSub.addItem(lRow)
+                        }
+                    }
+                    gSub.addItem(.separator())
+                    for pct in [25, 50, 75, 100] {
+                        let bIt = NSMenuItem(title: "Helligkeit \(pct) %",
+                                             action: #selector(AppDelegate.hueSetBrightnessMenu(_:)), keyEquivalent: "")
+                        bIt.target = ctrl
+                        bIt.representedObject = ["groupId": g.id, "brightness": Double(pct)] as [String: Any]
+                        gSub.addItem(bIt)
+                    }
+                    if !g.scenes.isEmpty {
+                        gSub.addItem(.separator())
+                        for sc in g.scenes.prefix(12) {
+                            let sIt = NSMenuItem(title: "Szene: \(sc.name)",
+                                                 action: #selector(AppDelegate.hueActivateSceneMenu(_:)), keyEquivalent: "")
+                            sIt.target = ctrl
+                            sIt.representedObject = ["sceneId": sc.id, "groupId": g.id] as [String: Any]
+                            gSub.addItem(sIt)
+                        }
+                    }
+                    let row = NSMenuItem(title: "\(g.isOn ? "●" : "○") \(g.name)\(g.isOn ? " (\(Int(g.brightness)) %)" : "")", action: nil, keyEquivalent: "")
+                    row.submenu = gSub
+                    hueMenu.addItem(row)
+                }
+
+                hueMenu.addItem(.separator())
+                let allOff = NSMenuItem(title: "Alle Lichter aus", action: #selector(AppDelegate.hueAllOffMenu), keyEquivalent: "")
+                allOff.target = ctrl
+                hueMenu.addItem(allOff)
+            }
+
+            hueMenu.addItem(.separator())
+            let refItem = NSMenuItem(title: "Hue jetzt aktualisieren", action: #selector(AppDelegate.hueRefreshMenu), keyEquivalent: "")
+            refItem.target = ctrl
+            hueMenu.addItem(refItem)
+
+            let discItem = NSMenuItem(title: "Hue Bridge trennen", action: #selector(AppDelegate.hueDisconnectMenu), keyEquivalent: "")
+            discItem.target = ctrl
+            hueMenu.addItem(discItem)
+        } else {
+            let pairItem = NSMenuItem(title: ctrl.hue.isPairing ? "Koppeln läuft… (Bridge-Knopf drücken)" : "Hue Bridge verbinden…",
+                                      action: #selector(AppDelegate.huePairMenu), keyEquivalent: "")
+            pairItem.target = ctrl
+            pairItem.isEnabled = !ctrl.hue.isPairing
+            hueMenu.addItem(pairItem)
+        }
+
+        let hueRoot = NSMenuItem(title: "✦ Philips Hue", action: nil, keyEquivalent: "")
+        hueRoot.submenu = hueMenu
+        menu.addItem(hueRoot)
 
         menu.addItem(.separator())
 
@@ -590,6 +954,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var blurView: NSVisualEffectView!
     var canvas: WidgetCanvasView!
     let model = SystemModel()
+    let hue = HueClient()
     var timer: Timer?
 
     var autoDisplayProfile: Bool = true
@@ -598,9 +963,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var laptopScale: CGFloat = 0.85     // Passend proportioniert für 14" MacBook Solo
     var uiScale: CGFloat = 1.15
 
+    var hueBarEnabled: Bool = true      // Nutzer-Schalter im Menü: Hue-Leiste ein/aus
+    var hueHideOnLaptop: Bool = true    // Automatik: unterwegs (14" Solo) ausblenden
+
     var refreshInterval: TimeInterval = 1.0
     var pinnedToDesktop: Bool = true
     var positionLocked: Bool = false
+
+    var shouldShowHueBar: Bool {
+        if hue.isPairing { return true }
+        guard hueBarEnabled else { return false }
+        if hueHideOnLaptop && activeProfile == .laptop { return false }
+        return hue.isReachable && !hue.groups.isEmpty
+    }
+
+    private var hueRowsNeeded: Int {
+        let n = hue.groups.count
+        guard n > 0 else { return 1 }
+        return (n + WidgetCanvasView.hueColsPerRow - 1) / WidgetCanvasView.hueColsPerRow
+    }
+
+    private func widgetSize(for scale: CGFloat, showHue: Bool, hueRows: Int = 1) -> NSSize {
+        let baseH = showHue ? (WidgetCanvasView.coreHeight + WidgetCanvasView.hueSectionHeight(forRows: hueRows)) : WidgetCanvasView.coreHeight
+        return NSSize(width: WidgetCanvasView.baseWidth * scale, height: baseH * scale)
+    }
+
+    func updateHueVisibility(animate: Bool = true) {
+        let show = shouldShowHueBar
+        let rows = hueRowsNeeded
+        guard canvas != nil, window != nil else { return }
+        if canvas.showHueSection == show && (!show || canvas.hueRowCount == rows) {
+            canvas.needsDisplay = true
+            return
+        }
+        canvas.showHueSection = show
+        canvas.hueRowCount = rows
+        let oldFrame = window.frame
+        let newSize = widgetSize(for: uiScale, showHue: show, hueRows: rows)
+        // Oberkante beim Auf-/Zuklappen der Hue-Leiste stabil halten
+        var newOrigin = NSPoint(x: oldFrame.minX, y: oldFrame.maxY - newSize.height)
+        if let screen = window.screen ?? NSScreen.main {
+            let vf = screen.visibleFrame
+            newOrigin.x = max(vf.minX + 8, min(newOrigin.x, vf.maxX - newSize.width - 8))
+            newOrigin.y = max(vf.minY + 8, min(newOrigin.y, vf.maxY - newSize.height - 8))
+        }
+        window.setFrame(NSRect(origin: newOrigin, size: newSize), display: true, animate: animate)
+        blurView.frame = NSRect(origin: .zero, size: newSize)
+        blurView.maskImage = Self.roundedMaskImage(size: newSize, radius: 22 * uiScale)
+        canvas.frame = NSRect(origin: .zero, size: newSize)
+        canvas.needsDisplay = true
+        window.invalidateShadow()
+    }
 
     /// Erkennt, ob ein externer/großer Monitor angeschlossen ist (.external) oder nur das eingebaute MacBook-Display läuft (.laptop).
     static func detectDisplayProfile() -> (profile: DisplayProfile, targetScreen: NSScreen?) {
@@ -717,6 +1130,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let r = ud.object(forKey: "refreshInterval") as? Double, r >= 0.25, r <= 10.0 { refreshInterval = r }
         if let p = ud.object(forKey: "pinnedToDesktop") as? Bool { pinnedToDesktop = p }
         if let l = ud.object(forKey: "positionLocked") as? Bool { positionLocked = l }
+        if let he = ud.object(forKey: "hueBarEnabled") as? Bool { hueBarEnabled = he }
+        if let hl = ud.object(forKey: "hueHideOnLaptop") as? Bool { hueHideOnLaptop = hl }
 
         if ud.dictionary(forKey: "desktopWidgetPos_external") == nil,
            let legacyPos = ud.dictionary(forKey: "desktopWidgetPos") {
@@ -731,8 +1146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             uiScale = CGFloat(s)
         }
 
-        let size = NSSize(width: WidgetCanvasView.baseWidth * uiScale,
-                          height: WidgetCanvasView.baseHeight * uiScale)
+        let size = widgetSize(for: uiScale, showHue: false)
 
         window = DesktopWidgetWindow(contentRect: NSRect(origin: .zero, size: size),
                                      styleMask: [.borderless],
@@ -766,9 +1180,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let initialOrigin = resolvedOrigin(for: size, profile: activeProfile, preferredScreen: detected.targetScreen)
         window.setFrameOrigin(initialOrigin)
         if let shotOut = screenshotPath {
+            let demoHue = CommandLine.arguments.contains("--demo-hue")
             uiScale = 1.15
             canvas.uiScale = 1.15
-            let shotSize = NSSize(width: WidgetCanvasView.baseWidth * uiScale, height: WidgetCanvasView.baseHeight * uiScale)
+            if demoHue {
+                hue.loadDemoGroupsForScreenshot()
+                canvas.showHueSection = true
+                canvas.hueRowCount = 1
+            }
+            let shotSize = widgetSize(for: uiScale, showHue: demoHue, hueRows: 1)
             window.setFrame(NSRect(origin: window.frame.origin, size: shotSize), display: false)
             blurView.frame = NSRect(origin: .zero, size: shotSize)
             blurView.maskImage = Self.roundedMaskImage(size: shotSize, radius: 22 * uiScale)
@@ -801,6 +1221,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
+
+        // Philips Hue Live-Polling verbinden (blendet Leiste nur ein, wenn Bridge lokal erreichbar & aktiviert)
+        hue.onUpdate = { [weak self] in
+            self?.updateHueVisibility(animate: true)
+        }
+        hue.startPolling()
 
         model.tick()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
@@ -858,8 +1284,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             targetScale = uiScale
         }
 
-        let newSize = NSSize(width: WidgetCanvasView.baseWidth * targetScale,
-                             height: WidgetCanvasView.baseHeight * targetScale)
+        let showHue = shouldShowHueBar
+        let rows = hueRowsNeeded
+        canvas.showHueSection = showHue
+        canvas.hueRowCount = rows
+        let newSize = widgetSize(for: targetScale, showHue: showHue, hueRows: rows)
         let newOrigin = resolvedOrigin(for: newSize, profile: activeProfile, preferredScreen: detected.targetScreen)
 
         uiScale = targetScale
@@ -899,8 +1328,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func applyScale(_ newScale: CGFloat, keepTopRightAnchor: Bool) {
         let oldFrame = window.frame
-        let newSize = NSSize(width: WidgetCanvasView.baseWidth * newScale,
-                             height: WidgetCanvasView.baseHeight * newScale)
+        let showHue = shouldShowHueBar
+        let rows = hueRowsNeeded
+        canvas.showHueSection = showHue
+        canvas.hueRowCount = rows
+        let newSize = widgetSize(for: newScale, showHue: showHue, hueRows: rows)
         var newOrigin: NSPoint
         if keepTopRightAnchor {
             newOrigin = NSPoint(x: oldFrame.maxX - newSize.width, y: oldFrame.maxY - newSize.height)
@@ -923,6 +1355,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         canvas.needsDisplay = true
         window.invalidateShadow()
         saveCurrentPosition(newOrigin)
+    }
+
+    // MARK: - Philips Hue Menu Actions
+
+    @objc func toggleHueVisible() {
+        hueBarEnabled.toggle()
+        UserDefaults.standard.set(hueBarEnabled, forKey: "hueBarEnabled")
+        updateHueVisibility(animate: true)
+    }
+
+    @objc func toggleHueHideOnLaptop() {
+        hueHideOnLaptop.toggle()
+        UserDefaults.standard.set(hueHideOnLaptop, forKey: "hueHideOnLaptop")
+        updateHueVisibility(animate: true)
+    }
+
+    @objc func huePairMenu() {
+        hueBarEnabled = true
+        UserDefaults.standard.set(true, forKey: "hueBarEnabled")
+        hue.startPairing { [weak self] _, _ in
+            self?.updateHueVisibility(animate: true)
+        }
+    }
+
+    @objc func hueDisconnectMenu() {
+        hue.disconnect()
+        updateHueVisibility(animate: true)
+    }
+
+    @objc func hueRefreshMenu() {
+        hue.refreshNow()
+    }
+
+    @objc func hueAllOffMenu() {
+        hue.allLightsOff()
+    }
+
+    @objc func hueToggleGroupMenu(_ sender: NSMenuItem) {
+        if let gid = sender.representedObject as? String {
+            hue.toggleGroup(gid)
+        }
+    }
+
+    @objc func hueSetBrightnessMenu(_ sender: NSMenuItem) {
+        if let dict = sender.representedObject as? [String: Any],
+           let gid = dict["groupId"] as? String,
+           let bri = dict["brightness"] as? Double {
+            hue.setGroupBrightness(gid, brightness: bri)
+        }
+    }
+
+    @objc func hueActivateSceneMenu(_ sender: NSMenuItem) {
+        if let dict = sender.representedObject as? [String: Any],
+           let sid = dict["sceneId"] as? String,
+           let gid = dict["groupId"] as? String {
+            hue.activateScene(sid, inGroup: gid)
+        }
+    }
+
+    @objc func hueToggleLightMenu(_ sender: NSMenuItem) {
+        if let lid = sender.representedObject as? String {
+            hue.toggleLight(lid)
+        }
+    }
+
+    @objc func hueSetLightBrightnessMenu(_ sender: NSMenuItem) {
+        if let dict = sender.representedObject as? [String: Any],
+           let lid = dict["lightId"] as? String,
+           let bri = dict["brightness"] as? Double {
+            hue.setLightBrightness(lid, brightness: bri)
+        }
     }
 
     @objc func toggleAutoDisplayProfile() {
